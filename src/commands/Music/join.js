@@ -10,7 +10,11 @@ export default {
         .setDescription('Join your voice channel without starting playback'),
 
     async execute(interaction, config, client) {
-        await deferMusicCommand(interaction);
+        const deferred = await deferMusicCommand(interaction);
+        if (!deferred) {
+            return;
+        }
+
         const embed = await joinVoiceChannel(client, interaction);
         await replyMusicSuccess(interaction, embed);
     },

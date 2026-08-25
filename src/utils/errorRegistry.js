@@ -142,6 +142,10 @@ export function resolveErrorCode({ error, errorType = 'unknown', context = {} } 
 
   const code = normalizeErrorCode(error?.code);
   if (code) {
+    if (/^\d+$/.test(code) && Number(code) >= 10000) {
+      return ErrorCodes.DISCORD_API_ERROR;
+    }
+
     return code;
   }
 

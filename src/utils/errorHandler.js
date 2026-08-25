@@ -67,6 +67,120 @@ const DATABASE_ERROR_CODES = new Set([
     '40001', '40P01', // serialization failure / deadlock
 ]);
 
+const TECHNICAL_ERROR_PATTERNS = [
+    /^typeerror:/i,
+    /^referenceerror:/i,
+    /^syntaxerror:/i,
+    /cannot read propert/i,
+    /is not a function/i,
+    /is not defined/i,
+    /unexpected token/i,
+    /econnrefused|enotfound|etimedout|econnreset/i,
+    /node_modules/i,
+    /\sat\s.+\(.+\:\d+\:\d+\)/,
+];
+
+const USER_FACING_ERROR_HINTS = [
+    /^please\b/i,
+    /^you must\b/i,
+    /^provide\b/i,
+    /^select\b/i,
+    /^choose\b/i,
+    /^enter\b/i,
+    /^that\b/i,
+    /^this\b/i,
+    /^unsupported\b/i,
+    /^unknown command\b/i,
+    /^invalid\b/i,
+    /^missing\b/i,
+    /^cannot\b/i,
+    /^could not find\b/i,
+];
+
+function isUserFacingPlainError(error) {
+    if (error instanceof TitanBotError) {
+        return false;
+    }
+
+    const message = typeof error?.message === 'string' ? error.message.trim() : '';
+    if (!message || message.length > 500 || message.includes('\n')) {
+        return false;
+    }
+
+    if (TECHNICAL_ERROR_PATTERNS.some((pattern) => pattern.test(message))) {
+        return false;
+    }
+
+    const lowerMessage = message.toLowerCase();
+    if (USER_FACING_ERROR_HINTS.some((pattern) => pattern.test(message))) {
+        return true;
+    }
+
+    if (lowerMessage.includes('not found')
+        || lowerMessage.includes('not configured')
+        || lowerMessage.includes('not set up')
+        || lowerMessage.includes('not available')
+        || lowerMessage.includes('permission')
+        || lowerMessage.includes('must be ')
+        || lowerMessage.includes('at least ')
+        || lowerMessage.includes('no longer than ')
+        || lowerMessage.includes('at most ')) {
+        return true;
+    }
+
+    return false;
+}
+
+function inferErrorTypeFromUserMessage(message = '') {
+    const lowerMessage = message.toLowerCase();
+
+    if (lowerMessage.includes('permission') || lowerMessage.includes('not allowed')) {
+        return ErrorTypes.PERMISSION;
+    }
+
+    if (lowerMessage.includes('rate limit') || lowerMessage.includes('cooldown') || lowerMessage.includes('too quickly')) {
+        return ErrorTypes.RATE_LIMIT;
+    }
+
+    if (lowerMessage.includes('database') || lowerMessage.includes('postgres') || lowerMessage.includes('sql')) {
+        return ErrorTypes.DATABASE;
+    }
+
+    if (lowerMessage.includes('not found')
+        || lowerMessage.includes('not configured')
+        || lowerMessage.includes('not set up')
+        || lowerMessage.includes('disabled')
+        || lowerMessage.includes('unknown command')
+        || lowerMessage.includes('unknown category')) {
+        return ErrorTypes.CONFIGURATION;
+    }
+
+    if (lowerMessage.includes('channel') || lowerMessage.includes('user') || lowerMessage.includes('role') || lowerMessage.includes('mention')) {
+        return ErrorTypes.USER_INPUT;
+    }
+
+    return ErrorTypes.VALIDATION;
+}
+
+function normalizeInteractionError(error, context = {}) {
+    if (error instanceof TitanBotError) {
+        return error;
+    }
+
+    if (!isUserFacingPlainError(error)) {
+        return error;
+    }
+
+    const message = error.message.trim();
+    const type = inferErrorTypeFromUserMessage(message);
+
+    return createError(message, type, message, {
+        ...context,
+        expected: true,
+        source: context.source || 'normalizeInteractionError',
+    });
+}
+
 export function categorizeError(error) {
     if (error instanceof TitanBotError) {
         return error.type;
@@ -112,6 +226,14 @@ export function categorizeError(error) {
         return ErrorTypes.CONFIGURATION;
     }
 
+    if (isUserFacingPlainError(error)) {
+        return inferErrorTypeFromUserMessage(error.message);
+    }
+
+    if (error?.name === 'DiscordAPIError' || error?.name === 'HTTPError') {
+        return ErrorTypes.DISCORD_API;
+    }
+
     return ErrorTypes.UNKNOWN;
 }
 
@@ -144,7 +266,10 @@ const UserMessages = {
     [ErrorTypes.DISCORD_API]: {
         default: 'Discord rejected that request. Please try again in a moment.',
         rate_limit: "You're doing that too quickly. Wait a moment and try again.",
-        forbidden: "I'm not allowed to do that here. Check my role permissions."
+        forbidden: "I'm not allowed to do that here. Check my role permissions.",
+        interaction_expired: 'That interaction expired. Please run the command again.',
+        already_acknowledged: 'That action was already handled. Run the command again if you still need help.',
+        invalid_form_body: 'Discord rejected the request payload. Try again with different input.'
     },
     [ErrorTypes.USER_INPUT]: {
         default: 'There was a problem with your request. Check your input and try again.',
@@ -174,6 +299,22 @@ export function getUserMessage(error, context = {}) {
 
     if (error.userMessage) {
         return error.userMessage;
+    }
+
+    if (isUserFacingPlainError(error)) {
+        return error.message.trim();
+    }
+
+    if (type === ErrorTypes.DISCORD_API) {
+        if (error?.code === 10062) {
+            return messages.interaction_expired;
+        }
+        if (error?.code === 40060 || error?.code === 50027) {
+            return messages.already_acknowledged;
+        }
+        if (error?.code === 50035) {
+            return messages.invalid_form_body;
+        }
     }
 
     if (context.subtype && messages[context.subtype]) {
@@ -353,7 +494,8 @@ const USER_ERROR_TYPES = new Set([
     ErrorTypes.VALIDATION,
     ErrorTypes.RATE_LIMIT,
     ErrorTypes.USER_INPUT,
-    ErrorTypes.PERMISSION
+    ErrorTypes.PERMISSION,
+    ErrorTypes.CONFIGURATION,
 ]);
 
 function buildErrorReference(resolvedErrorCode, traceId) {
@@ -362,14 +504,15 @@ function buildErrorReference(resolvedErrorCode, traceId) {
 }
 
 export async function handleInteractionError(interaction, error, context = {}) {
-    const errorType = categorizeError(error);
-    const userMessage = getUserMessage(error, context);
-    const { logData, traceId, resolvedErrorCode } = buildErrorLogData(interaction, error, errorType, context);
+    const normalizedError = normalizeInteractionError(error, context);
+    const errorType = categorizeError(normalizedError);
+    const userMessage = getUserMessage(normalizedError, context);
+    const { logData, traceId, resolvedErrorCode } = buildErrorLogData(interaction, normalizedError, errorType, context);
 
-    logInteractionError(error, errorType, logData);
+    logInteractionError(normalizedError, errorType, logData);
 
     // System errors get a reference code so users can report them and we can grep logs.
-    const isUserError = USER_ERROR_TYPES.has(errorType) || error?.context?.expected === true;
+    const isUserError = USER_ERROR_TYPES.has(errorType) || normalizedError?.context?.expected === true;
     const description = isUserError
         ? userMessage
         : `${userMessage}\n\n-# Ref: \`${buildErrorReference(resolvedErrorCode, traceId)}\``;

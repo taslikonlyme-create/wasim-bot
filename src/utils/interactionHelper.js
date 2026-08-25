@@ -132,6 +132,7 @@ export class InteractionHelper {
             }
             if (error.name === 'InteractionAlreadyReplied' || error.code === 40060) {
                 logger.warn(`Interaction ${interaction.id} already acknowledged during defer:`, error.message);
+                interaction.replied = true;
                 return true;
             }
             logger.error('Failed to defer reply:', error);

@@ -1,6 +1,8 @@
-import { MessageFlags } from 'discord.js';
+import { once } from 'node:events';
+import { MessageFlags, PermissionFlagsBits } from 'discord.js';
 import { successEmbed } from '../../utils/embeds.js';
 import { InteractionHelper } from '../../utils/interactionHelper.js';
+import { botHasPermission } from '../../utils/permissionGuard.js';
 import { TitanBotError, ErrorTypes } from '../../utils/errorHandler.js';
 import { getGuildMusicData, clearUpdateInterval } from './playerStore.js';
 import { canControlMusic, requireVoiceChannel, VOICE_CHANNEL_DENIAL } from './permissions.js';
@@ -13,6 +15,80 @@ import {
 import { refreshPlayerMessage } from './playerHandler.js';
 
 const YOUTUBE_URL_PATTERN = /(?:youtube\.com|youtu\.be)/i;
+const PLAYER_CONNECT_TIMEOUT_MS = 12_000;
+
+function getConnectedLavalinkNodes(client) {
+    if (!client.riffy?.nodeMap) {
+        return [];
+    }
+
+    return [...client.riffy.nodeMap.values()].filter((node) => node.connected);
+}
+
+export function assertLavalinkNodeAvailable(client) {
+    if (!getConnectedLavalinkNodes(client).length) {
+        throw new TitanBotError(
+            'Lavalink unavailable',
+            ErrorTypes.CONFIGURATION,
+            'Music is temporarily unavailable — no Lavalink nodes are connected. Try again shortly or configure your own Lavalink server.',
+        );
+    }
+}
+
+function assertBotVoicePermissions(channel) {
+    if (!channel) {
+        throw new TitanBotError(
+            'Voice channel unavailable',
+            ErrorTypes.CONFIGURATION,
+            'Could not access that voice channel.',
+        );
+    }
+
+    if (!botHasPermission(channel, [PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])) {
+        throw new TitanBotError(
+            'Missing voice permissions',
+            ErrorTypes.PERMISSION,
+            'I need **Connect** and **Speak** permissions in your voice channel.',
+        );
+    }
+}
+
+async function waitForPlayerConnection(player) {
+    if (player.connected) {
+        return;
+    }
+
+    try {
+        await player.connection.resolve();
+    } catch {
+        // Fall through to event-based wait below.
+    }
+
+    if (player.connected) {
+        return;
+    }
+
+    try {
+        await once(player, 'connectionRestored', {
+            signal: AbortSignal.timeout(PLAYER_CONNECT_TIMEOUT_MS),
+        });
+    } catch {
+        // Timed out waiting for Lavalink to confirm the voice session.
+    }
+
+    if (!player.connected) {
+        throw new TitanBotError(
+            'Voice connection failed',
+            ErrorTypes.CONFIGURATION,
+            'Could not connect to the voice channel. Ensure Lavalink is online, the bot has Connect and Speak permissions, then try again.',
+        );
+    }
+}
+
+async function startPlayback(player) {
+    await waitForPlayerConnection(player);
+    await player.play();
+}
 
 export function getPlayer(client, guildId) {
     return client.riffy?.players?.get(guildId) || null;
@@ -50,6 +126,7 @@ export function assertCanControl(member, player) {
 
 export async function ensurePlayer(client, interaction) {
     assertRiffyAvailable(client);
+    assertLavalinkNodeAvailable(client);
     assertInVoice(interaction.member);
 
     const guildId = interaction.guild.id;
@@ -88,6 +165,7 @@ export async function joinVoiceChannel(client, interaction) {
     const guildId = interaction.guild.id;
     const guildData = getGuildMusicData(guildId);
     const channel = interaction.member.voice.channel;
+    assertBotVoicePermissions(channel);
     let player = getPlayer(client, guildId);
 
     if (player && player.voiceChannel !== channel.id) {
@@ -150,7 +228,7 @@ export async function playQuery(client, interaction, query) {
         }
 
         if (!player.playing && !player.paused) {
-            player.play();
+            await startPlayback(player);
         }
 
         return {
@@ -187,7 +265,7 @@ export async function playQuery(client, interaction, query) {
         const queuePosition = player.queue.length;
 
         if (willPlayNow) {
-            player.play();
+            await startPlayback(player);
         }
 
         return {
@@ -526,9 +604,9 @@ export async function leaveVoiceChannel(client, interaction) {
 }
 
 export async function replyMusicSuccess(interaction, embed) {
-    if (interaction.deferred || interaction.replied) {
-        await InteractionHelper.safeEditReply(interaction, { embeds: [embed] });
-    } else {
-        await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    const options = { embeds: [embed] };
+    if (!interaction._isPrefixCommand) {
+        options.flags = MessageFlags.Ephemeral;
     }
+    await InteractionHelper.safeReply(interaction, options);
 }
